@@ -1,206 +1,105 @@
-# Wikipedia Edit Stream Analytics
+# 📊 Wikipedia Edit Stream Analytics
 
-## Overview & Motivation
+A real-time streaming pipeline that consumes Wikipedia's public global edit firehose, scores every edit for vandalism and suspicious activity with rule-based heuristics, and surfaces live analytics on a dashboard, running entirely on Docker Compose with no cloud account, no API keys, and no dataset to download.
 
-Wikipedia Edit Stream Analytics adalah project portfolio data engineering yang memonitor firehose edit publik Wikipedia secara real-time. Project ini mengimplementasikan pipeline streaming end-to-end yang:
+## Overview
 
-- Mengonsumsi data event edit Wikipedia secara langsung dari EventStreams API
-- Menerapkan scoring berbasis aturan yang canggih untuk mendeteksi vandalism dan aktivitas mencurigakan
-- Menyimpan data terstruktur dalam format Parquet (bronze layer) dan DuckDB (silver layer)
-- Menghasilkan tabel agregasi denormalized (gold layer) untuk dashboard
-- Menyediakan dashboard live yang menunjukkan volume edit, suspicious feeds, dan rasio bot/human
+Unlike a typical batch ELT project, this pipeline has no dataset to seed. The moment the stack starts, the producer opens a live connection to Wikimedia's [EventStreams API](https://wikitech.wikimedia.org/wiki/Event_Platform/EventStreams) and begins ingesting every edit made across Wikipedia, in every language, every second, for as long as the stack runs.
 
-Ini adalah project lengkap yang dijalankan secara lokal dengan seluruh pipeline streaming data end-to-end, menggunakan Docker dan teknologi Python modern.
+Each edit is scored against six weighted heuristics (large content deletions, anonymous IP editors, empty comments on big changes, suspicious keywords, edit-warring patterns, and bot exclusion), stored through a bronze/silver/gold medallion architecture, and visualized on an auto-refreshing dashboard.
 
-## Arsitektur
+## Architecture
 
 ```mermaid
-graph TB
-    subgraph "Source"
-        Wikimedia[.wikimedia.org/stream]
-    end
-    
-    subgraph "Producer"
-        Producer[Producer Service]
-        Producer --> Redpanda
-    end
-    
-    subgraph "Broker"
-        Redpanda["Redpanda (Kafka API)"]
-        Broker1["topic: wikipedia.recentchange.raw"]
-        Redpanda --- Broker1
-    end
-    
-    subgraph "Consumer"
-        Consumer[Consumer Service]
-        Consumer --> Broker1
-        
-        subgraph "Processing"
-            Scoring[Rule-Based Scoring]
-            DuckDB[Sink DuckDB - enriched_edits]
-            Parquet[Sink Parquet - bronze]
-        end
-    end
-    
-    subgraph "Aggregator"
-        Aggregator[Aggregator Service]
-        Aggregator --> DuckDB
-        
-        subgraph "Gold Tables"
-            Volume1min[gold_edit_volume_1min]
-            TopPages15min[gold_top_pages_15min]
-            SuspiciousFeed[gold_suspicious_feed]
-            BotHumanRatio[gold_bot_human_ratio_1min]
-        end
-    end
-    
-    subgraph "Dashboard"
-        Dashboard[Streamlit Dashboard]
-        Dashboard --> Volume1min
-        Dashboard --> TopPages15min
-        Dashboard --> SuspiciousFeed
-        Dashboard --> BotHumanRatio
-    end
-    
-    Wikimedia --> Producer
-    Consumer --> Aggregator
-    Aggregator --> Dashboard
-    
-    style Producer fill:#e3f2fd,stroke:#2196f3
-    style Consumer fill:#f3e5f5,stroke:#9c27b0
-    style Aggregator fill:#e8f5e8,stroke:#4caf50
-    style Dashboard fill:#fff3e0,stroke:#ff9800
-    style Redpanda fill:#fff8e1,stroke:#ffc107
+graph LR
+    A[Wikimedia EventStreams<br/>SSE firehose] --> B[Producer]
+    B -->|publish| C[(Redpanda<br/>Kafka-compatible broker)]
+    C -->|consume| D[Consumer]
+    D -->|silver| E[(DuckDB<br/>enriched_edits)]
+    D -->|bronze, batched 60s| F[(Parquet<br/>partitioned by date/hour)]
+    E --> G[Aggregator]
+    G -->|gold, every 60s| H[(DuckDB<br/>gold_* tables)]
+    H --> I[Dashboard<br/>Streamlit]
 ```
+
+**Producer**: connects to `stream.wikimedia.org/v2/stream/recentchange`, parses each SSE event, validates it with Pydantic, and publishes it to a Redpanda topic. Reconnects automatically with exponential backoff (1s to 60s) on any disconnect.
+
+**Redpanda**: single-node, Kafka-API-compatible broker. Chosen over vanilla Kafka for a much lighter resource footprint, which matters on a 16GB-RAM machine running four other services alongside it.
+
+**Consumer**: reads raw events off the topic, computes a suspicion score per edit (see below), writes enriched records to a DuckDB `enriched_edits` table (silver layer), and batches raw events into hourly-partitioned Parquet files (bronze layer) every 60 seconds.
+
+**Aggregator**: a scheduled job (every 60s) that pre-computes four gold tables so the dashboard never has to scan the full silver table, plus a retention job that deletes bronze Parquet files older than 3 days so disk usage doesn't grow unbounded.
+
+**Dashboard**: a Streamlit app, auto-refreshing every 5 seconds, reading only from the gold tables: live edit volume, top edited pages, a suspicious-edit feed with links back to the actual Wikipedia page, and a bot-vs-human ratio chart.
+
+## Suspicion Scoring
+
+Every non-bot edit is scored 0 to 100 against these rules; a score of 50 or higher flags it as suspicious.
+
+| Condition | Points |
+|---|---|
+| Large content removal (`length.new - length.old < -500`) | +30 |
+| Anonymous editor (IP address) editing outside the Talk namespace | +15 |
+| Empty edit comment on a large change (`\|Δlength\| > 1000`) | +10 |
+| Comment matches a configured suspicious keyword | +25 |
+| Same user edits the same page more than 3 times within 5 minutes | +20 |
+| `bot == true` | Score locked to 0. Bots are tracked separately for the bot/human ratio, never flagged as suspicious |
+
+Keywords live in `config/suspicious_keywords.yaml`, so the list can be tuned without touching code.
+
+## Notable Engineering Challenges
+
+This pipeline looked deceptively simple on paper but surfaced a handful of real, non-obvious bugs during development, the kind that only show up once you actually try to run something end to end against a live external stream:
+
+- **Silent 403s from a header that never made it onto the request.** Building an `httpx.Request` by hand and sending it through `client.send()` doesn't inherit the headers set on `AsyncClient(headers=...)` the way convenience methods like `.get()` do, so the producer was quietly sending Wikimedia a request with no `User-Agent` at all.
+- **A schema built for an envelope that doesn't exist.** The initial event schema assumed a CloudEvents-style wrapper (`type`/`topic`/`source`/`data`), but Wikimedia's actual recentchange stream is flat: every field except `meta` sits at the top level. Every single event failed validation until this was caught.
+- **DuckDB's single-writer lock, discovered the hard way.** With the consumer, aggregator, and dashboard all touching the same DuckDB file, the aggregator's scheduled job was silently failing on every single cycle with `Conflicting lock is held`, because the consumer held its connection open continuously rather than just during writes. Fixed with a buffer-and-flush pattern plus read-only, short-lived connections from the dashboard and aggregator.
+- **Testing an infinite stream with a request method built for finite ones.** An early diagnosis concluded Wikimedia was blocking Docker containers outright, but the test that "proved" it used `httpx.get()` against an SSE endpoint that never closes its response, which will time out anywhere, blocked or not. Re-testing with `httpx.stream()` disproved the theory in seconds.
+
+## Tech Stack
+
+Python 3.11, httpx, confluent-kafka, Redpanda, DuckDB, Pydantic v2, APScheduler, Streamlit, Plotly, pytest, Docker Compose
 
 ## Setup & Run
 
-### Prasyarat
+No dataset, no API key, and no cloud account are required. The only prerequisite is Docker.
 
-- Docker Desktop (Docker Engine v20.10+)
-- Docker Compose v2+
-- Memori RAM: minimal 16GB (disarankan 32GB untuk kinerja optimal)
+```bash
+# 1. Copy the environment template and adjust if needed
+cp .env.example .env
 
-### Penyiapan
+# 2. Build and start the full stack
+docker compose up --build
 
-1. **Clone repository** (jika belum):
-   ```bash
-   git clone <repository-url>
-   cd wikipedia-edit-stream-analytics
-   ```
+# 3. Open the dashboard
+# http://localhost:8501
+```
 
-2. **Jalankan semua service**:
-   ```bash
-   docker compose up --build
-   ```
+Give it two to three minutes after startup for edits to accumulate before the charts look meaningful. To stop everything:
 
-3. **Akses dashboard**:
-   - Buka browser dan kunjungi `http://localhost:8501`
-   - Dashboard akan mulai refresh otomatis setiap 5 detik
+```bash
+docker compose down
+```
 
-4. **Hentikan semua service**:
-   ```bash
-   docker compose down
-   ```
+### Running the tests
 
-### Pilihan SSE Client: `httpx`
+```bash
+pip install -r consumer/requirements.txt -r producer/requirements.txt pytest
+pytest tests/ -v
+```
 
-AGENTS.md mengizinkan `httpx` (streaming mode) atau `sseclient-py`. Project ini memakai **`httpx.AsyncClient`** (`response.aiter_lines()` pada request dengan `stream=True`) karena:
-- Sudah async-native, cocok dengan `asyncio` event loop yang dipakai producer untuk reconnect logic.
-- `sseclient-py` bersifat sinkron/blocking, sehingga butuh thread terpisah untuk tidak memblokir loop async — kompleksitas ekstra yang tidak dibutuhkan.
-- `httpx` juga dipakai untuk logic reconnect (exponential backoff) tanpa dependency tambahan.
+## Dashboard
 
-### Estimasi RAM per Service
-
-| Service | RAM per container | Total RAM (max) | Catatan |
-|---------|------------------|-----------------|--------|
-| Redpanda | 2 GB | 2 GB | Broker Kafka, penyimpanan data streaming |
-| Producer | 512 MB | 512 MB | SSE client, Kafka producer, validasi Pydantic |
-| Consumer | 1 GB | 1 GB | Kafka consumer, scoring rules, write DuckDB/Parquet |
-| Aggregator | 512 MB | 512 MB | APScheduler, DuckDB queries, cleanup jobs |
-| Dashboard | 512 MB | 512 MB | Streamlit, Plotly, DuckDB reads |
-| **Total** | **~4 GB** | **4 GB** | Jauh di bawah 16GB batas |
-
-## Suspicion Score Rules
-
-Sistem scoring rule-based menghitung suspicion score (0-100) untuk setiap edit. Sebuah edit dianggap **mencurigakan** jika score >= 50.
-
-| Kondisi | Poin | Keterangan |
-|-----------|------|-------------|
-| **Pengurangan konten besar**: `length.new - length.old < -500` | +30 | Edit menghapus lebih dari 500 byte |
-| **Editor anonim (IPv4/IPv6)** mengedit namespace selain Talk | +15 | IP addresses dianggap anonim |
-| **Comment kosong** pada perubahan besar (`|length.new - length.old| > 1000`) | +10 | Comment kosong dengan perubahan ukuran signifikan |
-| **Comment mengandung kata kunci** dari `config/suspicious_keywords.yaml` (case-insensitive) | +25 | Deteksi keywords vandalism/spam |
-| **User yang sama** mengedit halaman yang sama >3 kali dalam window 5 menit terakhir | +20 | Pola edit-warring |
-| **Bot == true** | Score dikunci ke 0 | Bot tidak pernah ditandai suspicious |
-
-**Bobot maksimum**: total skor dibatasi maksimal 100.
-
-## Dashboard Features
-
-### KPI Row
-- **Edit Rate**: Edits per detik (rolling 1 menit)
-- **Total Edits**: Cumulative edit sejak service start
-- **Active Wikis**: Number of different wikis yang aktif dalam 5 menit terakhir
-- **Suspicious %**: Persentase edit yang ditandai suspicious
-
-### Charts
-- **Edit Volume**: Line chart editted volume per wiki (30 menit terakhir)
-- **Top Pages**: Bar chart top 10 halaman paling banyak diedit (15 menit terakhir)
-- **Suspicious Feed**: Tabel 50 edit suspicious terbaru dengan page links
-- **Bot vs Human**: Ratio perbandingan edit bot vs human per menit
-
-## Screenshot
-
-![Dashboard Screenshot](docs/screenshot-dashboard.png)
-
-*(Placeholder — ganti dengan screenshot dashboard aktual setelah `docker compose up --build` berjalan minimal beberapa menit dan menampilkan data live.)*
+- **Live KPIs**: edits per second (rolling 1-minute), total edits since start, active wikis, percent flagged suspicious
+- **Edit volume**: line chart of the last 30 minutes
+- **Top pages**: the 10 most-edited pages in the last 15 minutes
+- **Suspicious feed**: the 200 most recent flagged edits, with score, matched reasons, and a direct link back to the page on Wikipedia
+- **Bot vs. human**: edit counts per minute, split by bot flag
 
 ## Known Limitations
 
-1. **Koneksi SSE**: Stream Wikimedia bisa mengalami timeout; sistem menggunakan exponential backoff (1-60 detik) tapi bisa kehilangan event singkat saat reconnect.
-
-2. **I/O Sink Storage**: Batasan write performance untuk Parquet files bisa menjadi bottleneck saat volume edit tinggi (terutama pada bursts vandalism).
-
-3. **Delay Aggregator**: Job agregasi terjadwal (interval 60 detik) introduces ~1 menit delay antara edit dan munculnya di dashboard.
-
-4. **Kapasitas Scoring**: Rule-based scoring sederhana bisa memiliki false positives untuk pattern edit legitimate (misalnya, sejumlah besar edit kecil dari user yang sama).
-
-5. **Namespace Check**: Deteksi IP di namespace Talk menggunakan hardcoded check; tidak mencakup namespace khusus (misalnya, MediaWiki, Template).
-
-6. **Cleanup Jobs**: Cleanup bronze files berjalan sebagai bagian dari siklus aggregator (tiap 60 detik), jadi file lebih tua dari `MAX_BRONZE_RETENTION_DAYS` tidak langsung terhapus di detik itu juga, hanya di siklus aggregator berikutnya.
-
-7. **DuckDB Single-Writer File Lock**: DuckDB (mode embedded, bukan client/server) hanya mengizinkan satu proses memegang file database dalam satu waktu. Consumer, aggregator, dan dashboard semuanya membuka koneksi secara periodik dan singkat (bukan menahan koneksi permanen — lihat BUGS.md Bug #32/#33) dengan retry+backoff otomatis, sehingga dalam praktiknya jarang gagal. Tapi query ad-hoc dari luar aplikasi (mis. `docker compose exec consumer python -c "duckdb.connect(...)"` untuk debugging manual) tidak punya retry tersebut dan **bisa sesekali kena `Conflicting lock`** jika persis bertabrakan dengan salah satu proses di atas — cukup diulang beberapa detik kemudian.
-
-## File Configuration
-
-- `.env.example`: Template environment variables
-- `config/suspicious_keywords.yaml`: Kata kunci untuk mendeteksi vandalism
-- `docker-compose.yml`: Definisi service dan resource limits
-
-## Monitoring
-
-- **Producer**: Log status koneksi SSE, events yang diformat, dan publish Kafka
-- **Consumer**: Logging activity batch, DuckDB writes, dan buffer parquet
-- **Aggregator**: Log completion job agregasi dan file cleanup
-- **Dashboard**: Built-in Streamlit logging dan error handling
-
-Untuk debug, lihat container logs:
-```bash
-docker compose logs -f [service-name]
-```
-
-## Pengembangan Lanjutan
-
-Saran untuk peningkatan:
-
-1. **ML-based Detection**: Ganti/add scoring rules dengan classifier yang diawasi
-2. **Stream Processing**: Gunakan Apache Flink atau Apache Beam untuk streaming processing
-3. **WebSocket Dashboard**: Real-time updates tanpa page refresh
-4. **Alert System**: Kirim notification ke Slack/Email saat vandalism terdeteksi
-5. **Multi-source**: Tambahkan Firehose API lain (misalnya, MediaWiki API)
-6. **More sophisticated NLP**: Gunakan embeddings semantic untuk comment analysis
-
-## Lisensi
-
-Project ini untuk tujuan portfolio. Lisensi tergantung pada contributor.
+- **Single-node deployment.** This is a portfolio-scale build, not designed to horizontally scale.
+- **DuckDB is single-writer.** Ad-hoc queries against the database file from outside the running services can occasionally hit a transient lock conflict; the application's own read and write paths already use retry-with-backoff and don't have this problem.
+- **The suspicious-edit feed depends on the observation window.** Vandalism-scale edits don't happen every minute on Wikipedia; if you check right after startup, `gold_suspicious_feed` may briefly be empty. The scoring logic is verified independently by the unit test suite regardless.
+- **Rule-based scoring only.** No ML-based classifier; this was a deliberate scope decision to keep the detection logic transparent, deterministic, and CPU-only.
+- **In-memory edit-warring detection.** The "same user, same page, 3x in 5 minutes" rule tracks state in the consumer's memory, so it resets if the consumer restarts.
