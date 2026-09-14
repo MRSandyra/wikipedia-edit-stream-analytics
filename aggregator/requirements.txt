@@ -1,0 +1,6 @@
+# Aggregator requirements
+duckdb==1.1.1
+apscheduler==3.10.4
+pydantic==2.9.0
+pydantic-settings==2.5.2
+python-dotenv==1.0.1

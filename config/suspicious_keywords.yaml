@@ -1,0 +1,39 @@
+# List kata kunci mencurigakan untuk mendeteksi vandalism
+# Format: case-insensitive match pada field comment
+suspicious_keywords:
+  - vandalism
+  - test edit
+  - "123"
+  - asdf
+  - qwerty
+  - blanking
+  - spam
+  - delete all
+  - remove all
+  - nonsense
+  - testing
+  - hello world
+  - "f*ck"
+  - "sh*t"
+  - "b*tch"
+  - asshole
+  - crap
+  - stupid
+  - idiot
+  - bullshit
+  - nsfw
+  - porn
+  - sex
+  - xxx
+  - penis
+  - vagina
+  - hitler
+  - nazi
+  - kill
+  - die
+  - death
+  - suicide
+  - hack
+  - hacked
+  - deface
+  - defaced

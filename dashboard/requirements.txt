@@ -1,0 +1,7 @@
+# Dashboard requirements
+streamlit==1.38.0
+plotly==5.24.0
+duckdb==1.1.1
+pydantic==2.9.0
+pydantic-settings==2.5.2
+python-dotenv==1.0.1

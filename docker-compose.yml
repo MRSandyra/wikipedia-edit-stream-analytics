@@ -1,0 +1,112 @@
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.17
+    container_name: redpanda
+    # --smp caps shard count explicitly: dev-container mode otherwise spins up
+    # one shard per host CPU core, which can starve each shard's memory slice
+    # on many-core hosts and crash Redpanda under a 2G mem_limit (Bug #27).
+    # --advertise-kafka-addr overrides dev-container's default 127.0.0.1
+    # advertised listener, which sibling containers can't reach (Bug #30).
+    command: ["redpanda", "start", "--mode", "dev-container", "--smp", "1", "--memory", "1900M", "--advertise-kafka-addr", "redpanda:9092"]
+    ports:
+      - "19092:19092"
+      - "8082:8082"
+      - "9092:9092"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+      - ./data:/app/data
+    mem_limit: 2G
+    deploy:
+      resources:
+        reservations:
+          memory: 2G
+    restart: unless-stopped
+
+  producer:
+    build:
+      context: .
+      dockerfile: ./producer/Dockerfile
+    container_name: producer
+    environment:
+      - REDPANDA_BOOTSTRAP_SERVERS=redpanda:9092
+      - REDPANDA_TOPIC=wikipedia.recentchange.raw
+      - LOG_LEVEL=INFO
+    depends_on:
+      - redpanda
+    mem_limit: 512M
+    deploy:
+      resources:
+        reservations:
+          memory: 512M
+    restart: unless-stopped
+
+  consumer:
+    build:
+      context: .
+      dockerfile: ./consumer/Dockerfile
+    container_name: consumer
+    environment:
+      - REDPANDA_BOOTSTRAP_SERVERS=redpanda:9092
+      - REDPANDA_TOPIC=wikipedia.recentchange.raw
+      - DUCKDB_PATH=/app/data/wikipedia.duckdb
+      - BRONZE_PATH=/app/data/bronze
+      - LOG_LEVEL=INFO
+    depends_on:
+      - redpanda
+      - producer
+    volumes:
+      - ./data:/app/data
+    mem_limit: 1G
+    deploy:
+      resources:
+        reservations:
+          memory: 1G
+    restart: unless-stopped
+
+  aggregator:
+    build:
+      context: .
+      dockerfile: ./aggregator/Dockerfile
+    container_name: aggregator
+    environment:
+      - DUCKDB_PATH=/app/data/wikipedia.duckdb
+      - BRONZE_PATH=/app/data/bronze
+      - MAX_BRONZE_RETENTION_DAYS=3
+      - LOG_LEVEL=INFO
+    depends_on:
+      - consumer
+    volumes:
+      - ./data:/app/data
+    mem_limit: 512M
+    deploy:
+      resources:
+        reservations:
+          memory: 512M
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: ./dashboard/Dockerfile
+    container_name: dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      - DUCKDB_PATH=/app/data/wikipedia.duckdb
+      - DASHBOARD_REFRESH_INTERVAL=5
+      - LOG_LEVEL=INFO
+    depends_on:
+      - consumer
+      - aggregator
+    volumes:
+      - ./data:/app/data
+    mem_limit: 512M
+    deploy:
+      resources:
+        reservations:
+          memory: 512M
+    restart: unless-stopped
+
+volumes:
+  redpanda-data:
+    driver: local
