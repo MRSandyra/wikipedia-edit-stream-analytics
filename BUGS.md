@@ -164,7 +164,7 @@ Log bug nyata yang ditemukan & diperbaiki selama proses build.
 **Tanggal**: 2026-09-14
 **Lokasi**: `tests/test_scoring.py`
 **Masalah**: Test awal tidak mencakup semua 8 kasus wajib (vandalism, legit, bot, threshold=50, IP on Talk, edit warring, empty comment large change, combination).
-**Perbaikan**: Menulis ulang test dengan 12 test cases lengkap
+**Perbaikan**: Menulis ulang test dengan 14 test cases lengkap
 **Status**: ✅ Fixed
 
 ---

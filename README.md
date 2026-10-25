@@ -53,7 +53,7 @@ This pipeline looked deceptively simple on paper but surfaced a handful of real,
 
 - **Silent 403s from a header that never made it onto the request.** Building an `httpx.Request` by hand and sending it through `client.send()` doesn't inherit the headers set on `AsyncClient(headers=...)` the way convenience methods like `.get()` do, so the producer was quietly sending Wikimedia a request with no `User-Agent` at all.
 - **A schema built for an envelope that doesn't exist.** The initial event schema assumed a CloudEvents-style wrapper (`type`/`topic`/`source`/`data`), but Wikimedia's actual recentchange stream is flat: every field except `meta` sits at the top level. Every single event failed validation until this was caught.
-- **DuckDB's single-writer lock, discovered the hard way.** With the consumer, aggregator, and dashboard all touching the same DuckDB file, the aggregator's scheduled job was silently failing on every single cycle with `Conflicting lock is held`, because the consumer held its connection open continuously rather than just during writes. Fixed with a buffer-and-flush pattern plus read-only, short-lived connections from the dashboard and aggregator.
+- **DuckDB's single-writer lock, discovered the hard way.** With the consumer, aggregator, and dashboard all touching the same DuckDB file, the aggregator's scheduled job was silently failing on every single cycle with `Conflicting lock is held`, because the consumer held its connection open continuously rather than just during writes. Fixed with a buffer-and-flush pattern plus short-lived connections everywhere: read-write for the aggregator (it rebuilds the gold tables), read-only for the dashboard.
 - **Testing an infinite stream with a request method built for finite ones.** An early diagnosis concluded Wikimedia was blocking Docker containers outright, but the test that "proved" it used `httpx.get()` against an SSE endpoint that never closes its response, which will time out anywhere, blocked or not. Re-testing with `httpx.stream()` disproved the theory in seconds.
 
 ## Tech Stack
@@ -91,9 +91,9 @@ pytest tests/ -v
 ## Dashboard
 
 - **Live KPIs**: edits per second (rolling 1-minute), total edits since start, active wikis, percent flagged suspicious
-- **Edit volume**: line chart of the last 30 minutes
+- **Edit volume**: line chart of the last minute's edit counts per wiki, recomputed every 60 seconds
 - **Top pages**: the 10 most-edited pages in the last 15 minutes
-- **Suspicious feed**: the 200 most recent flagged edits, with score, matched reasons, and a direct link back to the page on Wikipedia
+- **Suspicious feed**: the 50 most recently flagged edits (of up to 200 kept in the gold table), with score, comment, and a direct link back to the page on Wikipedia
 - **Bot vs. human**: edit counts per minute, split by bot flag
 
 ## Known Limitations
