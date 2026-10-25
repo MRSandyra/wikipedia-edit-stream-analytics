@@ -110,7 +110,7 @@ class Aggregator:
                     wiki,
                     COUNT(*) AS edit_count
                 FROM enriched_edits
-                WHERE processed_at >= NOW() - INTERVAL '1 minute'
+                WHERE processed_at >= NOW() - INTERVAL '30 minutes'
                 GROUP BY date_trunc('minute', processed_at), wiki
                 ORDER BY minute DESC, edit_count DESC
             """)
@@ -172,7 +172,7 @@ class Aggregator:
                     SUM(CASE WHEN bot = false THEN 1 ELSE 0 END) AS human_count,
                     COUNT(*) AS total_count
                 FROM enriched_edits
-                WHERE processed_at >= NOW() - INTERVAL '1 minute'
+                WHERE processed_at >= NOW() - INTERVAL '30 minutes'
                 GROUP BY date_trunc('minute', processed_at), wiki
                 ORDER BY minute DESC
             """)

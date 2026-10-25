@@ -8,6 +8,7 @@ import os
 import random
 import time
 from datetime import datetime, timedelta
+from urllib.parse import quote
 
 import streamlit as st
 import plotly.express as px
@@ -273,7 +274,7 @@ def display_suspicious_feed(conn):
                 # Create wiki link
                 def create_link(row):
                     wiki = row["wiki"]
-                    title = row["title"].replace(" ", "_")
+                    title = quote(row["title"].replace(" ", "_"))
                     return f"https://{wiki}.wikipedia.org/wiki/{title}"
                 
                 display_df["Page Link"] = display_df.apply(create_link, axis=1)
